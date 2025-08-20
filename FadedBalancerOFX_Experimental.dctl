@@ -1,0 +1,477 @@
+// FadedBalancerOFX v1.4.0
+// DaVinci Resolve DCTL plugin to rebalance RGB for faded film scans.
+//
+// Pipeline (per-pixel): presets → global → fade → per-channel → (optional preserve luminance) → channel mixer → mixing (darken/lighten) → replace → removal → (optional linear→Cineon) output
+//
+// Notes for colorists:
+// - "Preserve Luminance": keeps the picture's overall brightness similar after
+//   you change colors. Turn it on when you want to keep the same perceived
+//   brightness while fixing color casts.
+// - Presets: quick starting points for common faded film looks. They only set
+//   temporary values you can adjust; they do not change the sliders permanently.
+//
+// --- Preset identifiers & selector
+#define PRESET_NONE      0
+#define PRESET_EASTMAN1  1
+#define PRESET_EASTMAN2  2
+#define PRESET_EASTMAN3  3
+#define PRESET_EASTMAN4  4
+#define PRESET_EASTMAN5  5
+#define PRESET_EASTMAN6  6
+#define PRESET_EASTMAN7  7
+#define PRESET_EASTMAN8  8
+#define PRESET_EASTMAN9  9
+#define PRESET_EASTMAN10 10
+
+DEFINE_UI_PARAMS(presetMode, Preset, DCTLUI_COMBO_BOX, 0, { PRESET_NONE, PRESET_EASTMAN1, PRESET_EASTMAN2, PRESET_EASTMAN3, PRESET_EASTMAN4, PRESET_EASTMAN5, PRESET_EASTMAN6, PRESET_EASTMAN7, PRESET_EASTMAN8, PRESET_EASTMAN9, PRESET_EASTMAN10 }, { None, Red Compress Mid, Balanced Aggregate, Red Compress Hi Lift, Red Comp Blue Tweak, Heavy Red Crush, Mild Corrective, Neutral Red Mid Tweak, Strong Red Compress, Neg Offset Blue Cut, Highlight Lift Blue Shadow })
+// (presetBlend removed — presets apply directly to local copies before processing)
+
+
+// === UI PARAMETERS ===
+
+// Combo enum definitions (required by DEFINE_UI_PARAMS lists)
+// Darken / Lighten enums for Red
+#define RDW_NONE  0
+#define RDW_GREEN 1
+#define RDW_BLUE  2
+#define RLW_NONE  0
+#define RLW_GREEN 1
+#define RLW_BLUE  2
+
+// Darken / Lighten enums for Green
+#define GDW_NONE  0
+#define GDW_RED   1
+#define GDW_BLUE  2
+#define GLW_NONE  0
+#define GLW_RED   1
+#define GLW_BLUE  2
+
+// Darken / Lighten enums for Blue
+#define BDW_NONE  0
+#define BDW_RED   1
+#define BDW_GREEN 2
+#define BLW_NONE  0
+#define BLW_RED   1
+#define BLW_GREEN 2
+
+// Replace / Copy enums
+#define CR_NONE       0
+#define CR_FROM_GREEN 1
+#define CR_FROM_BLUE  2
+#define CG_NONE       0
+#define CG_FROM_RED   1
+#define CG_FROM_BLUE  2
+#define CB_NONE       0
+#define CB_FROM_RED   1
+#define CB_FROM_GREEN 2
+
+// Channel removal enums
+#define REM_NONE 0
+#define REM_RED  1
+#define REM_GREEN 2
+#define REM_BLUE 3
+#define REM_ALL  4
+
+
+// Global controls
+DEFINE_UI_PARAMS(fadeCorrection, ✨ Fade Correction, DCTLUI_SLIDER_FLOAT, 0.0f, 0.0f, 1.0f, 0.001f)
+DEFINE_UI_PARAMS(globalOffset,   🌐 Global Offset,   DCTLUI_SLIDER_FLOAT, 0.0f, -0.5f, 0.5f, 0.001f)
+DEFINE_UI_PARAMS(globalShadows,  🌑 Global Shadows,  DCTLUI_SLIDER_FLOAT, 0.0f, -0.5f, 0.5f, 0.001f)
+DEFINE_UI_PARAMS(globalMidtones, 🌓 Global Midtones, DCTLUI_SLIDER_FLOAT, 1.0f,  0.1f, 3.0f, 0.001f)
+DEFINE_UI_PARAMS(globalHighlights, 🌕 Global Highlights, DCTLUI_SLIDER_FLOAT, 1.0f, 0.1f, 3.0f, 0.001f)
+DEFINE_UI_PARAMS(preserveLuminance, ⚖️ Preserve Luminance, DCTLUI_CHECK_BOX, 0)
+ 
+// Per‑channel controls
+DEFINE_UI_PARAMS(redOffset,     🔴 Red Offset,     DCTLUI_SLIDER_FLOAT, 0.0f, -0.5f, 0.5f, 0.001f)
+DEFINE_UI_PARAMS(redShadows,    🔴 Red Shadows,    DCTLUI_SLIDER_FLOAT, 0.0f, -0.5f, 0.5f, 0.001f)
+DEFINE_UI_PARAMS(redMidtones,   🔴 Red Midtones,   DCTLUI_SLIDER_FLOAT, 1.0f,  0.1f, 3.0f, 0.001f)
+DEFINE_UI_PARAMS(redHighlights, 🔴 Red Highlights, DCTLUI_SLIDER_FLOAT, 1.0f,  0.1f, 3.0f, 0.001f)
+DEFINE_UI_PARAMS(greenOffset,     🟢 Green Offset,     DCTLUI_SLIDER_FLOAT, 0.0f, -0.5f, 0.5f, 0.001f)
+DEFINE_UI_PARAMS(greenShadows,    🟢 Green Shadows,    DCTLUI_SLIDER_FLOAT, 0.0f, -0.5f, 0.5f, 0.001f)
+DEFINE_UI_PARAMS(greenMidtones,   🟢 Green Midtones,   DCTLUI_SLIDER_FLOAT, 1.0f,  0.1f, 3.0f, 0.001f)
+DEFINE_UI_PARAMS(greenHighlights, 🟢 Green Highlights, DCTLUI_SLIDER_FLOAT, 1.0f,  0.1f, 3.0f, 0.001f)
+DEFINE_UI_PARAMS(blueOffset,     🔵 Blue Offset,     DCTLUI_SLIDER_FLOAT, 0.0f, -0.5f, 0.5f, 0.001f)
+DEFINE_UI_PARAMS(blueShadows,    🔵 Blue Shadows,    DCTLUI_SLIDER_FLOAT, 0.0f, -0.5f, 0.5f, 0.001f)
+DEFINE_UI_PARAMS(blueMidtones,   🔵 Blue Midtones,   DCTLUI_SLIDER_FLOAT, 1.0f,  0.1f, 3.0f, 0.001f)
+DEFINE_UI_PARAMS(blueHighlights, 🔵 Blue Highlights, DCTLUI_SLIDER_FLOAT, 1.0f,  0.1f, 3.0f, 0.001f)
+
+// Channel Mixer controls
+DEFINE_UI_PARAMS(redOutRedIn,   🔴➡️R Red In,   DCTLUI_SLIDER_FLOAT, 1.0f, -2.0f, 2.0f, 0.001f)
+DEFINE_UI_PARAMS(redOutGreenIn, 🔴➡️R Green In, DCTLUI_SLIDER_FLOAT, 0.0f, -2.0f, 2.0f, 0.001f)
+DEFINE_UI_PARAMS(redOutBlueIn,  🔴➡️R Blue In,  DCTLUI_SLIDER_FLOAT, 0.0f, -2.0f, 2.0f, 0.001f)
+
+DEFINE_UI_PARAMS(greenOutRedIn,   🟢➡️G Red In,   DCTLUI_SLIDER_FLOAT, 0.0f, -2.0f, 2.0f, 0.001f)
+DEFINE_UI_PARAMS(greenOutGreenIn, 🟢➡️G Green In, DCTLUI_SLIDER_FLOAT, 1.0f, -2.0f, 2.0f, 0.001f)
+DEFINE_UI_PARAMS(greenOutBlueIn,  🟢➡️G Blue In,  DCTLUI_SLIDER_FLOAT, 0.0f, -2.0f, 2.0f, 0.001f)
+
+DEFINE_UI_PARAMS(blueOutRedIn,   🔵➡️B Red In,   DCTLUI_SLIDER_FLOAT, 0.0f, -2.0f, 2.0f, 0.001f)
+DEFINE_UI_PARAMS(blueOutGreenIn, 🔵➡️B Green In, DCTLUI_SLIDER_FLOAT, 0.0f, -2.0f, 2.0f, 0.001f)
+DEFINE_UI_PARAMS(blueOutBlueIn,  🔵➡️B Blue In,  DCTLUI_SLIDER_FLOAT, 1.0f, -2.0f, 2.0f, 0.001f)
+
+// Channel mixing (darken/lighten composites)
+DEFINE_UI_PARAMS(redDarkenWith,   🔴🌙 Red Darken,   DCTLUI_COMBO_BOX, 0, { RDW_NONE, RDW_GREEN, RDW_BLUE }, { None, With Green, With Blue })
+DEFINE_UI_PARAMS(redLightenWith,  🔴☀️ Red Lighten,  DCTLUI_COMBO_BOX, 0, { RLW_NONE, RLW_GREEN, RLW_BLUE }, { None, With Green, With Blue })
+DEFINE_UI_PARAMS(greenDarkenWith, 🟢🌙 Green Darken, DCTLUI_COMBO_BOX, 0, { GDW_NONE, GDW_RED, GDW_BLUE }, { None, With Red, With Blue })
+DEFINE_UI_PARAMS(greenLightenWith, 🟢☀️ Green Lighten, DCTLUI_COMBO_BOX, 0, { GLW_NONE, GLW_RED, GLW_BLUE }, { None, With Red, With Blue })
+DEFINE_UI_PARAMS(blueDarkenWith,  🔵🌙 Blue Darken,  DCTLUI_COMBO_BOX, 0, { BDW_NONE, BDW_RED, BDW_GREEN }, { None, With Red, With Green })
+DEFINE_UI_PARAMS(blueLightenWith, 🔵☀️ Blue Lighten, DCTLUI_COMBO_BOX, 0, { BLW_NONE, BLW_RED, BLW_GREEN }, { None, With Red, With Green })
+
+// Replace / removal / output
+DEFINE_UI_PARAMS(copyRedSource,   🔴↔ Replace Red,   DCTLUI_COMBO_BOX, 0, { CR_NONE, CR_FROM_GREEN, CR_FROM_BLUE }, { None, With Green, With Blue })
+DEFINE_UI_PARAMS(copyGreenSource, 🟢↔ Replace Green, DCTLUI_COMBO_BOX, 0, { CG_NONE, CG_FROM_RED, CG_FROM_BLUE }, { None, With Red, With Blue })
+DEFINE_UI_PARAMS(copyBlueSource,  🔵↔ Replace Blue,  DCTLUI_COMBO_BOX, 0, { CB_NONE, CB_FROM_RED, CB_FROM_GREEN }, { None, With Red, With Green })
+DEFINE_UI_PARAMS(channelRemovalMode, 🗑️ Channel Removal, DCTLUI_COMBO_BOX, 0, { REM_NONE, REM_RED, REM_GREEN, REM_BLUE, REM_ALL }, { None, Remove Red, Remove Green, Remove Blue, Remove All })
+DEFINE_UI_PARAMS(outputToCineon, 🎞️ Output to Cineon Log, DCTLUI_CHECK_BOX, 0)
+
+
+// Short help text shown in the plugin UI (Resolve 19.1+). Tooltips must reference
+// the UI LABEL token (not the parameter identifier) per vendor macro spec.
+// v1.4.0: user goal–oriented wording for colorists.
+DEFINE_UI_TOOLTIP(Preset, "Starting looks for faded film")
+DEFINE_UI_TOOLTIP(✨ Fade Correction, "Restore contrast & color fade")
+DEFINE_UI_TOOLTIP(🌐 Global Offset, "Raise or lower whole image")
+DEFINE_UI_TOOLTIP(🌑 Global Shadows, "Lift or deepen shadows")
+DEFINE_UI_TOOLTIP(🌓 Global Midtones, "Adjust mid contrast")
+DEFINE_UI_TOOLTIP(🌕 Global Highlights, "Lift or tame highlights")
+DEFINE_UI_TOOLTIP(⚖️ Preserve Luminance, "Keep overall brightness")
+DEFINE_UI_TOOLTIP(🔴 Red Offset, "Shift red overall")
+DEFINE_UI_TOOLTIP(🔴 Red Shadows, "Correct red in shadows")
+DEFINE_UI_TOOLTIP(🔴 Red Midtones, "Compress / expand red mids")
+DEFINE_UI_TOOLTIP(🔴 Red Highlights, "Adjust red in highlights")
+DEFINE_UI_TOOLTIP(🟢 Green Offset, "Shift green overall")
+DEFINE_UI_TOOLTIP(🟢 Green Shadows, "Correct green in shadows")
+DEFINE_UI_TOOLTIP(🟢 Green Midtones, "Adjust green mids")
+DEFINE_UI_TOOLTIP(🟢 Green Highlights, "Adjust green highlights")
+DEFINE_UI_TOOLTIP(🔵 Blue Offset, "Shift blue overall")
+DEFINE_UI_TOOLTIP(🔵 Blue Shadows, "Correct blue in shadows")
+DEFINE_UI_TOOLTIP(🔵 Blue Midtones, "Adjust blue mids")
+DEFINE_UI_TOOLTIP(🔵 Blue Highlights, "Adjust blue highlights")
+
+DEFINE_UI_TOOLTIP(🔴➡️R Red In,   "Red output from Red input")
+DEFINE_UI_TOOLTIP(🔴➡️R Green In, "Red output from Green input")
+DEFINE_UI_TOOLTIP(🔴➡️R Blue In,  "Red output from Blue input")
+
+DEFINE_UI_TOOLTIP(🟢➡️G Red In,   "Green output from Red input")
+DEFINE_UI_TOOLTIP(🟢➡️G Green In, "Green output from Green input")
+DEFINE_UI_TOOLTIP(🟢➡️G Blue In,  "Green output from Blue input")
+
+DEFINE_UI_TOOLTIP(🔵➡️B Red In,   "Blue output from Red input")
+DEFINE_UI_TOOLTIP(🔵➡️B Green In, "Blue output from Green input")
+DEFINE_UI_TOOLTIP(🔵➡️B Blue In,  "Blue output from Blue input")
+
+DEFINE_UI_TOOLTIP(🔴🌙 Red Darken, "Red takes darker value")
+DEFINE_UI_TOOLTIP(🔴☀️ Red Lighten, "Red takes lighter value")
+DEFINE_UI_TOOLTIP(🟢🌙 Green Darken, "Green takes darker value")
+DEFINE_UI_TOOLTIP(🟢☀️ Green Lighten, "Green takes lighter value")
+DEFINE_UI_TOOLTIP(🔵🌙 Blue Darken, "Blue takes darker value")
+DEFINE_UI_TOOLTIP(🔵☀️ Blue Lighten, "Blue takes lighter value")
+DEFINE_UI_TOOLTIP(🔴↔ Replace Red, "Copy other channel into red")
+DEFINE_UI_TOOLTIP(🟢↔ Replace Green, "Copy other channel into green")
+DEFINE_UI_TOOLTIP(🔵↔ Replace Blue, "Copy other channel into blue")
+DEFINE_UI_TOOLTIP(🗑️ Channel Removal, "Mute channel(s) for check")
+DEFINE_UI_TOOLTIP(🎞️ Output to Cineon Log, "View in Cineon log space")
+
+
+
+// Helper functions (short notes)
+// The small functions below are building blocks used by the plugin. They are
+// safe for GPU use. For more technical details, contact info@fabiocolor.com.
+// Quick function map:
+// - safe_pow: per-channel gamma (keeps very dark pixels safe)
+// - applyLGGO: applies offset, shadows, midtones, highlights per channel
+// - applyFadeCorrection: gentle contrast and color boost for faded film
+// - linearToCineon: convert linear color to a film-log style for inspection
+
+// safe_pow: safe per-channel gamma. Keeps very small inputs from causing math
+// errors on the GPU by clamping the base before raising to a power.
+__DEVICE__ float safe_pow(float x, float y) { return _powf(_fmaxf(x, 1e-9f), y); }
+
+// applyLGGO: applies Offset, Shadows, Midtones, Highlights per channel. Use
+// this to fix color casts and shape contrast in shadows, midtones, and highlights.
+// Parameters:
+//   col       - input color
+//   offset    - per-channel additive offset
+//   shadows   - per-channel shadow adjustment (additive)
+//   midtones  - per-channel midtone exponent (1.0 = neutral)
+//   highlights- per-channel highlight scale (1.0 = neutral)
+__DEVICE__ float3 applyLGGO(float3 col, float3 offset, float3 shadows, float3 midtones, float3 highlights) {
+    col += offset;
+    col += shadows;
+    col.x = safe_pow(col.x, 1.0f / midtones.x);
+    col.y = safe_pow(col.y, 1.0f / midtones.y);
+    col.z = safe_pow(col.z, 1.0f / midtones.z);
+    col *= highlights;
+    return col;
+}
+
+// applyFadeCorrection:
+// Gentle increase of contrast and color for faded film. It gives a small
+// midtone contrast boost and brings back some saturation while keeping overall
+// brightness similar.
+__DEVICE__ float3 applyFadeCorrection(float3 col, float fadeCorrection) {
+    if (fadeCorrection > 0.0f) {
+        float luma = col.x * 0.2126f + col.y * 0.7152f + col.z * 0.0722f;
+        // smooth contrast curve (ease-in/out)
+        float contrastedLuma = luma * luma * (3.0f - 2.0f * luma);
+        float finalLuma = _mix(luma, contrastedLuma, fadeCorrection); // fadeCorrection in [0,1]
+        float3 lumaColor = make_float3(luma, luma, luma);
+        // Saturation: scale chroma, but keep _mix factor within [0,1] per vendor spec
+        float satScale = 1.0f + fadeCorrection; // 1..2
+        float3 saturatedCol = lumaColor + (col - lumaColor) * satScale; // manual lerp to avoid a>1 in _mix
+        col = _mix(col, saturatedCol, fadeCorrection);
+        float newLuma = col.x * 0.2126f + col.y * 0.7152f + col.z * 0.0722f;
+        if (newLuma > 1e-9f) col *= finalLuma / newLuma;
+    }
+    return col;
+}
+
+// linearToCineon: convert a linear value to a film-log like range for
+// inspection. Inputs <= 0 return 0 to avoid GPU math issues.
+__DEVICE__ float linearToCineon(float linear) {
+    if (linear <= 0.0f) return 0.0f;
+    // keep original formula but clamp result to [0,1]
+    float mapped = (1023.0f * (0.30102999566f * _log10f(linear * 0.9f) + 0.66666666667f)) / 1023.0f;
+    return _fmaxf(0.0f, _fminf(mapped, 1.0f));
+}
+
+
+// === MAIN TRANSFORM === (signature as required by Resolve)
+__DEVICE__ float4 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B, float p_A) {
+    // Preserve incoming pixel
+    float3 rgb = make_float3(p_R, p_G, p_B);
+
+    // --- local copies of UI params (presets only modify these)
+    float fadeCorrection_l    = fadeCorrection;
+    float globalOffset_l      = globalOffset;
+    float globalShadows_l     = globalShadows;
+    float globalMidtones_l    = globalMidtones;
+    float globalHighlights_l  = globalHighlights;
+    float preserveLuminance_l = preserveLuminance;
+
+    float redOffset_l     = redOffset;     float redShadows_l    = redShadows;    float redMidtones_l   = redMidtones;   float redHighlights_l   = redHighlights;
+    float greenOffset_l   = greenOffset;   float greenShadows_l  = greenShadows;  float greenMidtones_l = greenMidtones; float greenHighlights_l = greenHighlights;
+    float blueOffset_l    = blueOffset;    float blueShadows_l   = blueShadows;   float blueMidtones_l  = blueMidtones;  float blueHighlights_l  = blueHighlights;
+
+    // local copies for combo / copy / removal / output so presets can suggest them:
+    int redDarkenWith_l    = redDarkenWith;
+    int redLightenWith_l   = redLightenWith;
+    int greenDarkenWith_l  = greenDarkenWith;
+    int greenLightenWith_l = greenLightenWith;
+    int blueDarkenWith_l   = blueDarkenWith;
+    int blueLightenWith_l  = blueLightenWith;
+
+    int copyRedSource_l    = copyRedSource;
+    int copyGreenSource_l  = copyGreenSource;
+    int copyBlueSource_l   = copyBlueSource;
+
+    int channelRemovalMode_l = channelRemovalMode;
+    int outputToCineon_l     = (outputToCineon > 0.5f) ? 1 : 0;
+
+    // --- PRESET PRE-TRANSFORM
+    // prepare local preset suggestions (no UI overwrite)
+    int preset_applied = 0;
+    float preset_fade = 0.0f; // deprecated: presets no longer influence fadeCorrection
+
+    float p_globalOffset = 0.0f;
+    float p_globalShadows = 0.0f;
+    float p_globalMidtones = 1.0f;
+    float p_globalHighlights = 1.0f;
+
+    float p_redOffset = 0.0f;   float p_redShadows = 0.0f;   float p_redMidtones = 1.0f;   float p_redHighlights = 1.0f;
+    float p_greenOffset = 0.0f; float p_greenShadows = 0.0f; float p_greenMidtones = 1.0f; float p_greenHighlights = 1.0f;
+    float p_blueOffset = 0.0f;  float p_blueShadows = 0.0f;  float p_blueMidtones = 1.0f;  float p_blueHighlights = 1.0f;
+
+    int p_blueDarkenWith = BDW_NONE; // presets may still suggest channel darken mix
+
+    // Preset definitions (1-10): set local suggestion values only.
+
+    // 1: Red Compress Mid (most used) — contrast tweaked (lower offset, moderated highlights)
+    if (presetMode == PRESET_EASTMAN1) {
+        preset_applied = 1;
+        p_globalOffset = 0.090f; p_globalShadows = 0.000f; p_globalMidtones = 1.000f; p_globalHighlights = 0.920f; // was 0.112 / 0.819 / 0.950
+        p_redOffset = 0.000f; p_redShadows = 0.000f; p_redMidtones = 0.437f; p_redHighlights = 1.426f;
+        p_greenOffset = 0.000f; p_greenShadows = 0.000f; p_greenMidtones = 1.000f; p_greenHighlights = 1.000f;
+        p_blueOffset = 0.000f; p_blueShadows = 0.000f; p_blueMidtones = 1.000f; p_blueHighlights = 1.000f;
+        p_blueDarkenWith = BDW_GREEN;
+    }
+
+    // 2: Balanced Aggregate (general starting point)
+    if (presetMode == PRESET_EASTMAN2) {
+        preset_applied = 1;
+        p_globalOffset = 0.035f; p_globalShadows = 0.000f; p_globalMidtones = 1.000f; p_globalHighlights = 1.000f;
+        p_redOffset = 0.000f; p_redShadows = 0.000f; p_redMidtones = 0.325f; p_redHighlights = 1.269f;
+        p_greenOffset = 0.000f; p_greenShadows = 0.000f; p_greenMidtones = 1.000f; p_greenHighlights = 1.000f;
+        p_blueOffset = 0.000f; p_blueShadows = 0.000f; p_blueMidtones = 1.000f; p_blueHighlights = 1.000f;
+        p_blueDarkenWith = BDW_GREEN; // modal
+    }
+
+    // 3: Red Compress Hi Lift (red mid compression + modest highlight gain)
+    if (presetMode == PRESET_EASTMAN3) {
+        preset_applied = 1;
+        p_globalOffset = 0.043f; p_globalShadows = 0.000f; p_globalMidtones = 1.000f; p_globalHighlights = 1.112f;
+        p_redOffset = 0.000f; p_redShadows = 0.000f; p_redMidtones = 0.212f; p_redHighlights = 1.269f;
+        p_greenOffset = 0.000f; p_greenShadows = 0.000f; p_greenMidtones = 1.000f; p_greenHighlights = 1.000f;
+        p_blueOffset = 0.000f; p_blueShadows = 0.000f; p_blueMidtones = 1.000f; p_blueHighlights = 1.000f;
+        p_blueDarkenWith = BDW_GREEN;
+    }
+
+    // 4: Red Comp Blue Tweak (adds slight blue shadow reduction)
+    if (presetMode == PRESET_EASTMAN4) {
+        preset_applied = 1;
+        p_globalOffset = 0.000f; p_globalShadows = 0.000f; p_globalMidtones = 1.000f; p_globalHighlights = 1.089f;
+        p_redOffset = 0.000f; p_redShadows = 0.000f; p_redMidtones = 0.280f; p_redHighlights = 1.224f;
+        p_greenOffset = 0.000f; p_greenShadows = 0.000f; p_greenMidtones = 1.000f; p_greenHighlights = 1.000f;
+        p_blueOffset = 0.000f; p_blueShadows = -0.050f; p_blueMidtones = 1.000f; p_blueHighlights = 1.000f;
+    }
+
+    // 5: Heavy Red Crush (extreme red compression & highlight gain)
+    if (presetMode == PRESET_EASTMAN5) {
+        preset_applied = 1;
+    // Use values derived from Preset_01 (Heavy Red Crush sample)
+    p_globalOffset = 0.074f; p_globalShadows = 0.000f; p_globalMidtones = 1.000f; p_globalHighlights = 0.887f;
+    p_redOffset = -0.229f; p_redShadows = -0.500f; p_redMidtones = 1.471f; p_redHighlights = 3.000f;
+        p_greenOffset = 0.000f; p_greenShadows = 0.000f; p_greenMidtones = 1.000f; p_greenHighlights = 0.954f;
+        p_blueOffset = 0.000f; p_blueShadows = 0.000f; p_blueMidtones = 1.000f; p_blueHighlights = 1.000f;
+        p_blueDarkenWith = BDW_GREEN;
+    }
+
+    // 6: Mild Corrective (light overall balance)
+    if (presetMode == PRESET_EASTMAN6) {
+        preset_applied = 1;
+        p_globalOffset = 0.097f; p_globalShadows = 0.000f; p_globalMidtones = 1.000f; p_globalHighlights = 0.842f;
+        p_redOffset = 0.000f; p_redShadows = 0.000f; p_redMidtones = 0.325f; p_redHighlights = 1.000f;
+        p_greenOffset = 0.000f; p_greenShadows = 0.000f; p_greenMidtones = 1.000f; p_greenHighlights = 1.000f;
+        p_blueOffset = 0.000f; p_blueShadows = 0.000f; p_blueMidtones = 1.000f; p_blueHighlights = 1.067f;
+        p_blueDarkenWith = BDW_GREEN;
+    }
+
+    // 7: Neutral Red Mid Tweak (baseline neutral with red mid compression)
+    if (presetMode == PRESET_EASTMAN7) {
+        preset_applied = 1;
+        p_globalOffset = -0.043f; p_globalShadows = 0.000f; p_globalMidtones = 1.000f; p_globalHighlights = 1.000f;
+        p_redOffset = 0.000f; p_redShadows = 0.000f; p_redMidtones = 0.617f; p_redHighlights = 1.224f;
+        p_greenOffset = 0.000f; p_greenShadows = 0.000f; p_greenMidtones = 1.000f; p_greenHighlights = 1.000f;
+        p_blueOffset = 0.000f; p_blueShadows = 0.000f; p_blueMidtones = 1.000f; p_blueHighlights = 1.000f;
+    }
+
+    // 8: Strong Red Compress (strong compression & highlight lift)
+    if (presetMode == PRESET_EASTMAN8) {
+        preset_applied = 1;
+        p_globalOffset = 0.120f; p_globalShadows = 0.000f; p_globalMidtones = 1.000f; p_globalHighlights = 0.864f;
+        p_redOffset = 0.000f; p_redShadows = 0.004f; p_redMidtones = 0.235f; p_redHighlights = 1.426f;
+        p_greenOffset = 0.000f; p_greenShadows = 0.000f; p_greenMidtones = 1.000f; p_greenHighlights = 1.000f;
+        p_blueOffset = 0.000f; p_blueShadows = 0.000f; p_blueMidtones = 1.000f; p_blueHighlights = 1.000f;
+        p_blueDarkenWith = BDW_GREEN;
+    }
+
+    // 9: Neg Offset Blue Cut (negative offset & blue shadow reduction)
+    if (presetMode == PRESET_EASTMAN9) {
+        preset_applied = 1;
+        p_globalOffset = -0.167f; p_globalShadows = 0.000f; p_globalMidtones = 1.000f; p_globalHighlights = 1.067f;
+        p_redOffset = 0.000f; p_redShadows = 0.000f; p_redMidtones = 0.235f; p_redHighlights = 1.629f;
+        p_greenOffset = 0.000f; p_greenShadows = 0.000f; p_greenMidtones = 1.000f; p_greenHighlights = 1.000f;
+        p_blueOffset = 0.000f; p_blueShadows = -0.260f; p_blueMidtones = 1.000f; p_blueHighlights = 1.179f;
+        p_blueDarkenWith = BDW_GREEN;
+    }
+
+    // 10: Highlight Lift + Blue Shadow (Safer) — moderated highlight lift & gentler blue shadow tweak for broader footage
+    if (presetMode == PRESET_EASTMAN10) {
+        preset_applied = 1;
+        // Reduced globalHighlights 1.247f -> 1.200f to avoid clipping risk on dense scans
+        p_globalOffset = 0.035f; p_globalShadows = 0.000f; p_globalMidtones = 1.000f; p_globalHighlights = 1.200f;
+        p_redOffset = 0.000f; p_redShadows = 0.000f; p_redMidtones = 1.000f; p_redHighlights = 1.000f;
+        p_greenOffset = 0.000f; p_greenShadows = 0.000f; p_greenMidtones = 1.000f; p_greenHighlights = 1.000f;
+        p_blueOffset = 0.000f; p_blueShadows = -0.080f; p_blueMidtones = 1.000f; p_blueHighlights = 1.060f;
+        p_blueDarkenWith = BDW_GREEN; // matches sample 13 modal setting
+    }
+
+    // Apply preset pre-transform to original pixel first (if any preset selected).
+    if (preset_applied) {
+        // apply global-style preset pass first
+        rgb = applyLGGO(rgb,
+            make_float3(p_globalOffset, p_globalOffset, p_globalOffset),
+            make_float3(p_globalShadows, p_globalShadows, p_globalShadows),
+            make_float3(p_globalMidtones, p_globalMidtones, p_globalMidtones),
+            make_float3(p_globalHighlights, p_globalHighlights, p_globalHighlights));
+
+    // apply preset per-channel pass
+        rgb = applyLGGO(rgb,
+            make_float3(p_redOffset, p_greenOffset, p_blueOffset),
+            make_float3(p_redShadows, p_greenShadows, p_blueShadows),
+            make_float3(p_redMidtones, p_greenMidtones, p_blueMidtones),
+            make_float3(p_redHighlights, p_greenHighlights, p_blueHighlights));
+
+    // apply preset channel suggestions
+    if (p_blueDarkenWith != BDW_NONE) blueDarkenWith_l = p_blueDarkenWith;
+    }
+
+    // --- 1. Global Adjust (allowed to change luminance)
+    rgb = applyLGGO(rgb,
+        make_float3(globalOffset_l, globalOffset_l, globalOffset_l),
+        make_float3(globalShadows_l, globalShadows_l, globalShadows_l),
+        make_float3(globalMidtones_l, globalMidtones_l, globalMidtones_l),
+        make_float3(globalHighlights_l, globalHighlights_l, globalHighlights_l));
+
+    // --- 2. Fade Correction
+    rgb = applyFadeCorrection(rgb, fadeCorrection_l);
+
+    // Capture luma before per-channel adjustments for optional preservation.
+    float preChannelLuma = rgb.x * 0.2126f + rgb.y * 0.7152f + rgb.z * 0.0722f;
+
+    // --- 3. Per-Channel Adjust (optionally preserve luminance after this stage)
+    rgb = applyLGGO(rgb,
+        make_float3(redOffset_l, greenOffset_l, blueOffset_l),
+        make_float3(redShadows_l, greenShadows_l, blueShadows_l),
+        make_float3(redMidtones_l, greenMidtones_l, blueMidtones_l),
+        make_float3(redHighlights_l, greenHighlights_l, blueHighlights_l));
+    if (preserveLuminance_l > 0.5f) {
+        float postChannelLuma = rgb.x * 0.2126f + rgb.y * 0.7152f + rgb.z * 0.0722f;
+        if (postChannelLuma > 1e-9f) rgb *= preChannelLuma / postChannelLuma;
+    }
+
+    // local copies for channel mixer
+    float redOutRedIn_l     = redOutRedIn;
+    float redOutGreenIn_l   = redOutGreenIn;
+    float redOutBlueIn_l    = redOutBlueIn;
+
+    float greenOutRedIn_l   = greenOutRedIn;
+    float greenOutGreenIn_l = greenOutGreenIn;
+    float greenOutBlueIn_l  = greenOutBlueIn;
+
+    float blueOutRedIn_l    = blueOutRedIn;
+    float blueOutGreenIn_l  = blueOutGreenIn;
+    float blueOutBlueIn_l   = blueOutBlueIn;
+
+    // --- 4. Channel Mixer
+    float3 mixed_rgb;
+    mixed_rgb.x = rgb.x * redOutRedIn_l   + rgb.y * redOutGreenIn_l   + rgb.z * redOutBlueIn_l;
+    mixed_rgb.y = rgb.x * greenOutRedIn_l + rgb.y * greenOutGreenIn_l + rgb.z * greenOutBlueIn_l;
+    mixed_rgb.z = rgb.x * blueOutRedIn_l  + rgb.y * blueOutGreenIn_l  + rgb.z * blueOutBlueIn_l;
+    rgb = mixed_rgb;
+
+    // --- 5. Mixing (Darken / Lighten) — use local combo copies
+    if (redDarkenWith_l == RDW_GREEN) rgb.x = _fminf(rgb.x, rgb.y); else if (redDarkenWith_l == RDW_BLUE) rgb.x = _fminf(rgb.x, rgb.z);
+    if (redLightenWith_l == RLW_GREEN) rgb.x = _fmaxf(rgb.x, rgb.y); else if (redLightenWith_l == RLW_BLUE) rgb.x = _fmaxf(rgb.x, rgb.z);
+    if (greenDarkenWith_l == GDW_RED) rgb.y = _fminf(rgb.y, rgb.x); else if (greenDarkenWith_l == GDW_BLUE) rgb.y = _fminf(rgb.y, rgb.z);
+    if (greenLightenWith_l == GLW_RED) rgb.y = _fmaxf(rgb.y, rgb.x); else if (greenLightenWith_l == GLW_BLUE) rgb.y = _fmaxf(rgb.y, rgb.z);
+    if (blueDarkenWith_l == BDW_RED) rgb.z = _fminf(rgb.z, rgb.x); else if (blueDarkenWith_l == BDW_GREEN) rgb.z = _fminf(rgb.z, rgb.y);
+    if (blueLightenWith_l == BLW_RED) rgb.z = _fmaxf(rgb.z, rgb.x); else if (blueLightenWith_l == BLW_GREEN) rgb.z = _fmaxf(rgb.z, rgb.y);
+
+    // --- 5. Copy (use local copy sources)
+    if (copyRedSource_l == CR_FROM_GREEN) rgb.x = rgb.y; else if (copyRedSource_l == CR_FROM_BLUE) rgb.x = rgb.z;
+    if (copyGreenSource_l == CG_FROM_RED) rgb.y = rgb.x; else if (copyGreenSource_l == CG_FROM_BLUE) rgb.y = rgb.z;
+    if (copyBlueSource_l == CB_FROM_RED) rgb.z = rgb.x; else if (copyBlueSource_l == CB_FROM_GREEN) rgb.z = rgb.y;
+
+    // --- 6. Removal (use local removal)
+    if (channelRemovalMode_l == REM_RED || channelRemovalMode_l == REM_ALL) rgb.x = 0.0f;
+    if (channelRemovalMode_l == REM_GREEN || channelRemovalMode_l == REM_ALL) rgb.y = 0.0f;
+    if (channelRemovalMode_l == REM_BLUE || channelRemovalMode_l == REM_ALL) rgb.z = 0.0f;
+
+    // --- 7. Output (use local flag)
+    if (outputToCineon_l != 0) {
+        rgb.x = linearToCineon(rgb.x);
+        rgb.y = linearToCineon(rgb.y);
+        rgb.z = linearToCineon(rgb.z);
+    }
+    return make_float4(rgb.x, rgb.y, rgb.z, p_A);
+}
